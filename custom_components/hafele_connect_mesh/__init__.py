@@ -5,6 +5,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import aiohttp
 
@@ -52,6 +53,17 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     return unload_ok
 
+class ConnectMeshApiError(HomeAssistantError):
+    """Raised when the Connect Mesh cloud API returns an error."""
+
+
+def _raise_for_status(response: aiohttp.ClientResponse, action: str, body: str = "") -> None:
+    """Log and raise if the API did not answer with 200."""
+    if response.status != 200:
+        _LOGGER.error(f"Failed to {action}. Status code: {response.status}{body}")
+        raise ConnectMeshApiError(f"Failed to {action} (HTTP {response.status})")
+
+
 class ConnectMeshAPI:
     """API client for Connect Mesh."""
 
@@ -68,11 +80,8 @@ class ConnectMeshAPI:
             "Authorization": f"Bearer {self.api_token}"
         }
         async with self.session.get(f"{self.base_url}/devices/{unique_id}/status", headers=headers) as response:
-            if response.status == 200:
-                return await response.json()
-            else:
-                _LOGGER.error(f"Failed to get device status. Status code: {response.status}")
-                return None
+            _raise_for_status(response, "get device status")
+            return await response.json()
 
     async def set_power(self, unique_id: str, power: bool):
         """Set the power state of a device."""
@@ -89,8 +98,7 @@ class ConnectMeshAPI:
             "timeout_ms": 10000
         }
         async with self.session.put(f"{self.base_url}/devices/power", headers=headers, json=data) as response:
-            if response.status != 200:
-                _LOGGER.error(f"Failed to set power state. Status code: {response.status}")
+            _raise_for_status(response, "set power state")
 
     async def set_lightness(self, unique_id: str, lightness: float):
         """Set the lightness of a device."""
@@ -107,10 +115,8 @@ class ConnectMeshAPI:
             "timeout_ms": 10000
         }
         async with self.session.put(f"{self.base_url}/devices/lightness", headers=headers, json=data) as response:
-            if response.status != 200:
-                _LOGGER.error(f"Failed to set lightness. Status code: {response.status}")
-            else:
-                _LOGGER.debug(f"Set lightness to {lightness} for device {unique_id}")
+            _raise_for_status(response, "set lightness")
+            _LOGGER.debug(f"Set lightness to {lightness} for device {unique_id}")
 
     async def set_temperature(self, unique_id: str, temperature: int):
         """Set the color temperature of a device."""
@@ -127,10 +133,8 @@ class ConnectMeshAPI:
             "timeout_ms": 10000
         }
         async with self.session.put(f"{self.base_url}/devices/temperature", headers=headers, json=data) as response:
-            if response.status != 200:
-                _LOGGER.error(f"Failed to set temperature. Status code: {response.status}")
-            else:
-                _LOGGER.debug(f"Set temperature to {temperature}K for device {unique_id}")
+            _raise_for_status(response, "set temperature")
+            _LOGGER.debug(f"Set temperature to {temperature}K for device {unique_id}")
 
 
     async def set_hue_saturation(self, unique_id: str, hue: float, saturation: float):
@@ -149,10 +153,8 @@ class ConnectMeshAPI:
             "timeout_ms": 10000
         }
         async with self.session.put(f"{self.base_url}/devices/hue_saturation", headers=headers, json=data) as response:
-            if response.status != 200:
-                _LOGGER.error(f"Failed to set hue and saturation. Status code: {response.status}")
-            else:
-                _LOGGER.debug(f"Set hue to {hue} and saturation to {saturation} for device {unique_id}")
+            _raise_for_status(response, "set hue and saturation")
+            _LOGGER.debug(f"Set hue to {hue} and saturation to {saturation} for device {unique_id}")
 
 
     async def set_ctl(
@@ -180,7 +182,5 @@ class ConnectMeshAPI:
         }
         async with self.session.put(f"{self.base_url}/devices/ctl", headers=headers, json=data) as response:
             if response.status != 200:
-                body = await response.text()
-                _LOGGER.error(f"Failed to set CTL. Status code: {response.status} body={body}")
-            else:
-                _LOGGER.debug(f"Set CTL lightness={lightness} temperature={temperature} for {unique_id}")
+                _raise_for_status(response, "set CTL", f" body={await response.text()}")
+            _LOGGER.debug(f"Set CTL lightness={lightness} temperature={temperature} for {unique_id}")

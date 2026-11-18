@@ -6,6 +6,8 @@ from typing import Any
 from datetime import timedelta
 import asyncio
 
+import aiohttp
+
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
@@ -15,11 +17,13 @@ from homeassistant.components.light import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
+    UpdateFailed,
 )
 
 from .const import DOMAIN, MANUFACTURER
@@ -46,7 +50,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     
     async def async_update_data():
         """Fetch data from API."""
-        return {device["uniqueId"]: await api_client.get_device_status(device["uniqueId"]) for device in devices}
+        data = {}
+        last_error = None
+        for device in devices:
+            try:
+                data[device["uniqueId"]] = await api_client.get_device_status(device["uniqueId"])
+            except (HomeAssistantError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+                # Mark only this device as unavailable; others may still respond.
+                data[device["uniqueId"]] = None
+                last_error = err
+        if devices and last_error is not None and all(v is None for v in data.values()):
+            raise UpdateFailed(f"Connect Mesh API unreachable: {last_error}")
+        return data
 
     coordinator = DataUpdateCoordinator(
         hass,
@@ -99,6 +114,15 @@ class ConnectMeshLight(CoordinatorEntity, LightEntity):
         self.async_write_ha_state()
 
     @property
+    def available(self) -> bool:
+        """Return False if the last poll failed for this device."""
+        return (
+            super().available
+            and self.coordinator.data is not None
+            and self.coordinator.data.get(self._attr_unique_id) is not None
+        )
+
+    @property
     def is_on(self) -> bool | None:
         """Return true if light is on."""
         return self._state
@@ -118,51 +142,70 @@ class ConnectMeshLight(CoordinatorEntity, LightEntity):
         """Return the hs color value."""
         return self._hs_color
 
+    def _snapshot(self) -> tuple:
+        return (self._state, self._brightness, self._last_known_brightness, self._color_temp, self._hs_color)
+
+    def _restore(self, snapshot: tuple) -> None:
+        (self._state, self._brightness, self._last_known_brightness,
+         self._color_temp, self._hs_color) = snapshot
+
+    async def _apply_optimistically(self, update, call) -> None:
+        """Apply state optimistically, rolling back if the API call fails."""
+        snapshot = self._snapshot()
+        self._pending_update = True
+        update()
+        try:
+            await call()
+        except (HomeAssistantError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+            self._restore(snapshot)
+            self._pending_update = False
+            self.async_write_ha_state()
+            raise HomeAssistantError(f"Could not control {self.name}: {err}") from err
+        self.async_write_ha_state()
+        await self._async_update_ha_state()
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
-        self._state = True
-        self._pending_update = True
-
         ha_brightness = kwargs.get(ATTR_BRIGHTNESS, self._brightness or self._last_known_brightness or 255)
-        self._brightness = ha_brightness
-        self._last_known_brightness = ha_brightness
         lightness = self._ha_to_api_brightness(ha_brightness)  # 0.0..1.0
 
         kelvin = None
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             kelvin = max(MIN_KELVIN, min(MAX_KELVIN, int(kwargs[ATTR_COLOR_TEMP_KELVIN])))
-            self._color_temp = kelvin
 
-        if kelvin is not None:
-            await self._api_client.set_ctl(self._attr_unique_id, lightness, kelvin)
-        else:
-            if ATTR_BRIGHTNESS in kwargs:
+        def update() -> None:
+            self._state = True
+            self._brightness = ha_brightness
+            self._last_known_brightness = ha_brightness
+            if kelvin is not None:
+                self._color_temp = kelvin
+            if ATTR_HS_COLOR in kwargs:
+                self._hs_color = kwargs[ATTR_HS_COLOR]
+
+        async def call() -> None:
+            if kelvin is not None:
+                await self._api_client.set_ctl(self._attr_unique_id, lightness, kelvin)
+            elif ATTR_BRIGHTNESS in kwargs:
                 await self._api_client.set_lightness(self._attr_unique_id, lightness)
-            elif not self._brightness and self._last_known_brightness:
-                await self._api_client.set_lightness(
-                    self._attr_unique_id,
-                    self._ha_to_api_brightness(self._last_known_brightness),
-                )
             else:
                 await self._api_client.set_power(self._attr_unique_id, True)
-                
-        if ATTR_HS_COLOR in kwargs:
-            self._hs_color = kwargs[ATTR_HS_COLOR]
-            hue, saturation = self._hs_color
-            hue_api = hue / 360 * 65535
-            saturation_api = saturation / 100
-            await self._api_client.set_hue_saturation(self._attr_unique_id, hue_api, saturation_api)
 
-        self.async_write_ha_state()
-        await self._async_update_ha_state()
+            if ATTR_HS_COLOR in kwargs:
+                hue, saturation = kwargs[ATTR_HS_COLOR]
+                await self._api_client.set_hue_saturation(
+                    self._attr_unique_id, hue / 360 * 65535, saturation / 100
+                )
+
+        await self._apply_optimistically(update, call)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
-        self._state = False
-        self._pending_update = True
-        await self._api_client.set_power(self._attr_unique_id, False)
-        self.async_write_ha_state()
-        await self._async_update_ha_state()
+        def update() -> None:
+            self._state = False
+
+        await self._apply_optimistically(
+            update, lambda: self._api_client.set_power(self._attr_unique_id, False)
+        )
 
     @staticmethod
     def _api_to_ha_brightness(value: int) -> int:
